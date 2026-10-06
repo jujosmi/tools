@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: jujosmi-youtube-mp3
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
