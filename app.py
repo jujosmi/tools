@@ -1,18 +1,19 @@
+import base64
+import binascii
 import os
 import re
 import shutil
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
 from threading import Semaphore
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, render_template, request, send_file
 import yt_dlp
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024  # Only a URL is expected.
 
-# Keep simultaneous conversions bounded so one machine cannot be overwhelmed.
+# Bound concurrent conversions so a small Render instance is not overwhelmed.
 CONVERSION_SLOTS = Semaphore(2)
 
 YOUTUBE_HOSTS = {
@@ -44,19 +45,57 @@ def find_mp3(folder: Path) -> Path:
     mp3s = list(folder.glob("*.mp3"))
     if not mp3s:
         raise FileNotFoundError("Conversion finished but no MP3 file was produced.")
-    return max(mp3s, key=lambda p: p.stat().st_mtime)
+    return max(mp3s, key=lambda path: path.stat().st_mtime)
+
+
+def maybe_write_cookie_file(folder: Path) -> Path | None:
+    """Optionally load a cookies.txt file from a Render secret.
+
+    Set YOUTUBE_COOKIES_B64 to a base64-encoded Netscape cookies.txt only when
+    you have a legitimate reason to authenticate requests. Never commit cookies
+    to GitHub or put them directly in source code.
+    """
+    encoded = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    if not encoded:
+        return None
+
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RuntimeError("YOUTUBE_COOKIES_B64 is not valid base64.") from exc
+
+    if len(raw) > 2_000_000:
+        raise RuntimeError("YOUTUBE_COOKIES_B64 is unexpectedly large.")
+
+    cookie_file = folder / "cookies.txt"
+    cookie_file.write_bytes(raw)
+    return cookie_file
 
 
 def download_mp3(url: str, work_dir: Path) -> tuple[Path, str]:
     out_template = str(work_dir / "%(id)s.%(ext)s")
+    cookie_file = maybe_write_cookie_file(work_dir)
 
+    # Current yt-dlp guidance recommends a PO-token provider for YouTube's
+    # mweb GVS requests. These clients are ordered to provide useful fallbacks.
     options = {
         "format": "bestaudio/best",
         "outtmpl": out_template,
         "noplaylist": True,
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "restrictfilenames": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["mweb", "tv", "web_safari"],
+            },
+            "youtubepot-bgutilhttp": {
+                "base_url": [os.getenv("BGUTIL_BASE_URL", "http://127.0.0.1:4416")],
+            },
+        },
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -66,6 +105,9 @@ def download_mp3(url: str, work_dir: Path) -> tuple[Path, str]:
         ],
     }
 
+    if cookie_file is not None:
+        options["cookiefile"] = str(cookie_file)
+
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
         title = safe_filename(info.get("title") or "youtube-audio")
@@ -73,9 +115,30 @@ def download_mp3(url: str, work_dir: Path) -> tuple[Path, str]:
     return find_mp3(work_dir), title
 
 
+def friendly_error(exc: Exception) -> str:
+    message = str(exc)
+    lower = message.lower()
+
+    if "sign in to confirm" in lower or "not a bot" in lower:
+        return (
+            "YouTube is blocking this server's request. The converter's current "
+            "PO-token handling is enabled, but YouTube can still apply IP-based "
+            "bot checks to datacenter traffic."
+        )
+    if "private video" in lower:
+        return "That video is private and cannot be converted."
+    if "video unavailable" in lower or "this video is not available" in lower:
+        return "That video is unavailable."
+    if "age-restricted" in lower:
+        return "That video is age-restricted and cannot be converted anonymously."
+
+    return "Conversion failed. The video may be unavailable or restricted."
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
+
 
 @app.get("/youtube-mp3")
 def youtube_mp3_page():
@@ -84,7 +147,11 @@ def youtube_mp3_page():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "jujosmi-youtube-mp3"})
+    return jsonify({
+        "ok": True,
+        "service": "jujosmi-youtube-mp3",
+        "yt_dlp": getattr(yt_dlp.version, "__version__", "unknown"),
+    })
 
 
 @app.post("/api/convert")
@@ -95,7 +162,6 @@ def convert():
     if not is_youtube_url(url):
         return jsonify({"error": "Enter a valid YouTube video URL."}), 400
 
-    # Avoid queueing unbounded requests.
     if not CONVERSION_SLOTS.acquire(blocking=False):
         return jsonify({"error": "The converter is busy. Please try again in a moment."}), 429
 
@@ -105,9 +171,7 @@ def convert():
             mp3_path, title = download_mp3(url, temp_dir)
         except Exception as exc:
             app.logger.exception("YouTube conversion failed")
-            return jsonify({
-                "error": "Conversion failed. The video may be unavailable, restricted, or require a newer extractor."
-            }), 502
+            return jsonify({"error": friendly_error(exc)}), 502
 
         response = send_file(
             mp3_path,
@@ -117,7 +181,6 @@ def convert():
             max_age=0,
         )
 
-        # Flask finishes reading the file before this callback executes.
         @response.call_on_close
         def cleanup():
             shutil.rmtree(temp_dir, ignore_errors=True)

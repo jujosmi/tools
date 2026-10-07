@@ -1,10 +1,7 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.venv/
-env/
-.git/
+.git
 .gitignore
-.DS_Store
-downloads/*
+.venv
+__pycache__
+*.pyc
+*.zip
+README.md

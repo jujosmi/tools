@@ -1,46 +1,37 @@
-# Jujosmi YouTube → MP3 Web App
+# Jujosmi YouTube → MP3
 
-A real web page and server-side converter. Visitors open the site in a browser, paste a YouTube URL, and receive an MP3 download.
+A Flask web app for converting a YouTube video URL into a 192 kbps MP3 using yt-dlp and FFmpeg.
 
-## What this contains
+## Render deployment
 
-- Responsive Jujosmi-styled web page
-- `/youtube-mp3` route for hosting at `tools.jujosmi.com/youtube-mp3`
-- `POST /api/convert` conversion endpoint
-- FFmpeg MP3 extraction via yt-dlp
-- Health check at `/health`
-- Docker deployment configuration
-- Render blueprint (`render.yaml`)
+This repo is designed for a Render Docker Web Service.
 
-## Run locally
+The Docker image installs:
+- FFmpeg
+- Deno (yt-dlp's recommended JS runtime)
+- yt-dlp with its default EJS dependency group
+- BgUtils PO-token provider 2.0.1 and its local provider server
 
-Requirements:
-- Python 3.11+
-- FFmpeg installed and available on PATH
-- Deno installed and available on PATH
+The container starts the BgUtils provider privately on `127.0.0.1:4416` and Gunicorn on Render's `$PORT`.
 
-```bash
-python -m venv .venv
-.venv\\Scripts\\activate   # Windows
-pip install -r requirements.txt
-python app.py
+## Repository layout
+
+```text
+app.py
+Dockerfile
+Procfile
+render.yaml
+requirements.txt
+start.sh
+templates/index.html
+static/app.js
+static/styles.css
 ```
 
-Open `http://localhost:8080/youtube-mp3`.
+## Important
 
-## Put it on the internet
+YouTube can still apply IP-based anti-bot/login checks to datacenter IPs. The PO-token provider helps with current token requirements but does not guarantee bypassing every YouTube bot check.
 
-The simplest route is Render:
+An optional `YOUTUBE_COOKIES_B64` environment variable is supported for legitimate authenticated use. Treat exported cookies as credentials: never commit them to GitHub.
 
-1. Create a GitHub repository and upload this folder.
-2. In Render, create a new **Blueprint** from the repository.
-3. Render reads `render.yaml` and starts the Docker web service.
-4. Test the generated Render URL at `/youtube-mp3`.
-5. Add your custom domain, e.g. `tools.jujosmi.com`.
-6. Point your DNS record for `tools.jujosmi.com` to the Render-provided target.
-
-For `tools.jujosmi.com/youtube-mp3`, the Flask app already serves the page at that path.
-
-## Important production note
-
-Public conversion can be resource-intensive. Add rate limits, request logging, abuse protection, and a queue before opening it to a large audience. Use it only for media you have the right to download.
+Use the service only for content you are authorized to download.
