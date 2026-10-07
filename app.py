@@ -13,7 +13,7 @@ import yt_dlp
 
 app = Flask(__name__)
 
-# Bound concurrent conversions so a small Render instance is not overwhelmed.
+# Keep a small Render instance from being overwhelmed by concurrent conversions.
 CONVERSION_SLOTS = Semaphore(2)
 
 YOUTUBE_HOSTS = {
@@ -24,6 +24,19 @@ YOUTUBE_HOSTS = {
     "youtu.be",
     "www.youtu.be",
 }
+
+# Ordered fallback chain. These are public yt-dlp YouTube player clients with
+# different current PO-token requirements. web_embedded only works for videos
+# that allow embedding; web_safari may expose HLS; mweb uses the PO-token
+# provider; tv is a final anonymous fallback.
+YOUTUBE_CLIENTS = tuple(
+    x.strip()
+    for x in os.getenv(
+        "YOUTUBE_CLIENTS",
+        "web_embedded,web_safari,mweb,tv",
+    ).split(",")
+    if x.strip()
+)
 
 
 def is_youtube_url(value: str) -> bool:
@@ -72,12 +85,8 @@ def maybe_write_cookie_file(folder: Path) -> Path | None:
     return cookie_file
 
 
-def download_mp3(url: str, work_dir: Path) -> tuple[Path, str]:
+def build_options(work_dir: Path, client: str, cookie_file: Path | None) -> dict:
     out_template = str(work_dir / "%(id)s.%(ext)s")
-    cookie_file = maybe_write_cookie_file(work_dir)
-
-    # Current yt-dlp guidance recommends a PO-token provider for YouTube's
-    # mweb GVS requests. These clients are ordered to provide useful fallbacks.
     options = {
         "format": "bestaudio/best",
         "outtmpl": out_template,
@@ -90,10 +99,7 @@ def download_mp3(url: str, work_dir: Path) -> tuple[Path, str]:
         "fragment_retries": 3,
         "extractor_args": {
             "youtube": {
-                "player_client": ["mweb", "tv", "web_safari"],
-            },
-            "youtubepot-bgutilhttp": {
-                "base_url": [os.getenv("BGUTIL_BASE_URL", "http://127.0.0.1:4416")],
+                "player_client": [client],
             },
         },
         "postprocessors": [
@@ -105,14 +111,38 @@ def download_mp3(url: str, work_dir: Path) -> tuple[Path, str]:
         ],
     }
 
+    # Only the clients that can use BgUtils should point at its HTTP provider.
+    if client in {"mweb", "web", "web_safari", "ios"}:
+        options["extractor_args"]["youtubepot-bgutilhttp"] = {
+            "base_url": [os.getenv("BGUTIL_BASE_URL", "http://127.0.0.1:4416")],
+        }
+
     if cookie_file is not None:
         options["cookiefile"] = str(cookie_file)
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        title = safe_filename(info.get("title") or "youtube-audio")
+    return options
 
-    return find_mp3(work_dir), title
+
+def download_mp3(url: str, work_dir: Path) -> tuple[Path, str, str]:
+    cookie_file = maybe_write_cookie_file(work_dir)
+    failures: list[tuple[str, str]] = []
+
+    for client in YOUTUBE_CLIENTS:
+        app.logger.info("Trying YouTube player client: %s", client)
+        try:
+            with yt_dlp.YoutubeDL(build_options(work_dir, client, cookie_file)) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = safe_filename(info.get("title") or "youtube-audio")
+            return find_mp3(work_dir), title, client
+        except Exception as exc:
+            message = str(exc)
+            failures.append((client, message))
+            app.logger.warning("YouTube client %s failed: %s", client, message)
+
+    summary = " | ".join(
+        f"{client}: {msg[:300]}" for client, msg in failures
+    )
+    raise RuntimeError(f"All YouTube extraction clients failed. {summary}")
 
 
 def friendly_error(exc: Exception) -> str:
@@ -121,9 +151,9 @@ def friendly_error(exc: Exception) -> str:
 
     if "sign in to confirm" in lower or "not a bot" in lower:
         return (
-            "YouTube is blocking this server's request. The converter's current "
-            "PO-token handling is enabled, but YouTube can still apply IP-based "
-            "bot checks to datacenter traffic."
+            "YouTube rejected requests from the converter's server. "
+            "Multiple public extraction clients were tried, but this video "
+            "or the server IP is still being challenged by YouTube."
         )
     if "private video" in lower:
         return "That video is private and cannot be converted."
@@ -131,8 +161,10 @@ def friendly_error(exc: Exception) -> str:
         return "That video is unavailable."
     if "age-restricted" in lower:
         return "That video is age-restricted and cannot be converted anonymously."
+    if "only available for members" in lower or "members-only" in lower:
+        return "That video is members-only and cannot be converted anonymously."
 
-    return "Conversion failed. The video may be unavailable or restricted."
+    return "Conversion failed. The video may be unavailable, restricted, or blocked by YouTube."
 
 
 @app.get("/")
@@ -151,6 +183,8 @@ def health():
         "ok": True,
         "service": "jujosmi-youtube-mp3",
         "yt_dlp": getattr(yt_dlp.version, "__version__", "unknown"),
+        "youtube_clients": list(YOUTUBE_CLIENTS),
+        "po_token_provider": os.getenv("BGUTIL_BASE_URL", "http://127.0.0.1:4416"),
     })
 
 
@@ -168,9 +202,10 @@ def convert():
     temp_dir = Path(tempfile.mkdtemp(prefix="jujosmi-mp3-"))
     try:
         try:
-            mp3_path, title = download_mp3(url, temp_dir)
+            mp3_path, title, client = download_mp3(url, temp_dir)
+            app.logger.info("YouTube conversion succeeded with client: %s", client)
         except Exception as exc:
-            app.logger.exception("YouTube conversion failed")
+            app.logger.exception("YouTube conversion failed after all fallbacks")
             return jsonify({"error": friendly_error(exc)}), 502
 
         response = send_file(
