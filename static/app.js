@@ -1,5 +1,6 @@
 const form = document.getElementById("form");
 const input = document.getElementById("url");
+const bitrateSelect = document.getElementById("bitrate");
 const submit = document.getElementById("submit");
 const statusBox = document.getElementById("status");
 const download = document.getElementById("download");
@@ -18,18 +19,19 @@ function hideDownload(){
 async function start(){
   hideDownload();
   submit.disabled = true;
-  setStatus("Starting conversion…");
+  const bitrate = bitrateSelect.value;
+  setStatus(`Preparing ${bitrate} kbps MP3…`);
 
   try{
     const r = await fetch("/api/convert", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({url:input.value.trim()})
+      body:JSON.stringify({url:input.value.trim(), bitrate})
     });
     const data = await r.json();
     if(!r.ok || !data.ok) throw new Error(data.error || "Could not start conversion.");
-    setStatus("Processing your audio…");
-    await poll(data.jobId);
+    setStatus("Retrieving source audio…");
+    await poll(data.jobId, bitrate);
   }catch(err){
     setStatus(err.message || "Something went wrong.", true);
   }finally{
@@ -37,7 +39,7 @@ async function start(){
   }
 }
 
-async function poll(jobId){
+async function poll(jobId, bitrate){
   const maxMs = 8 * 60 * 1000;
   const started = Date.now();
 
@@ -48,17 +50,15 @@ async function poll(jobId){
 
     if(data.status === "ready"){
       const title = data.title || "your audio";
-      download.textContent = `Download MP3 — ${title}`;
-      download.href = data.downloadPath || `/api/download/${encodeURIComponent(jobId)}`;
-      // No download="" attribute here: the server returns an MP3 attachment on success and
-      // a readable HTML error page if the provider returns junk or the temporary link expires.
+      download.textContent = `Download ${bitrate} kbps MP3 — ${title}`;
+      download.href = `${data.downloadPath || `/api/download/${encodeURIComponent(jobId)}`}?bitrate=${encodeURIComponent(bitrate)}`;
       download.classList.remove("hidden");
-      setStatus("Your MP3 is ready. Click Download MP3 to retrieve it.");
+      setStatus(`Source audio is ready. Jujosmi will encode the MP3 at ${bitrate} kbps when you download it.`);
       return;
     }
 
     const progress = typeof data.progress === "number" ? ` ${Math.round(data.progress)}%` : "";
-    setStatus(`Processing your audio…${progress}`);
+    setStatus(`Preparing source audio…${progress}`);
     await new Promise(resolve => setTimeout(resolve, 2500));
   }
   throw new Error("This conversion is taking longer than expected. Try again in a moment.");
