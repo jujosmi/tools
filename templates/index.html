@@ -36,6 +36,15 @@
           </select>
           <p class="quality-help">Higher bitrate means a larger file. It cannot restore detail missing from the original audio.</p>
         </div>
+
+        <div class="quality-control">
+          <label for="effect">Audio effect</label>
+          <select id="effect" name="effect">
+            <option value="normal" selected>Normal audio</option>
+            <option value="8bit">8-bit Retro / Chiptune 🕹️</option>
+          </select>
+          <p class="quality-help">8-bit mode bit-crushes the sound, makes it mono, and narrows the audio bandwidth for a retro game-like effect.</p>
+        </div>
       </form>
 
       <div id="status" class="status hidden" role="status" aria-live="polite"></div>
