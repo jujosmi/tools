@@ -88,11 +88,14 @@ def convert():
     body = request.get_json(silent=True) or {}
     url = str(body.get("url", "")).strip()
     bitrate = str(body.get("bitrate", "192")).strip()
+    effect = str(body.get("effect", "normal")).strip().lower()
 
     if not valid_youtube_url(url):
         return jsonify({"ok": False, "error": "Enter a valid YouTube video or Shorts URL."}), 400
     if bitrate not in BITRATES:
         return jsonify({"ok": False, "error": "Choose a supported MP3 bitrate."}), 400
+    if effect not in {"normal", "8bit"}:
+        return jsonify({"ok": False, "error": "Choose a supported audio effect."}), 400
 
     # Request WAV from the provider so Jujosmi can choose the MP3 encoding bitrate itself.
     # The provider's `quality` parameter describes video resolution, not MP3 bitrate.
@@ -123,6 +126,7 @@ def convert():
         "ok": True,
         "jobId": job_id,
         "bitrate": bitrate,
+        "effect": effect,
         "status": data.get("status", "queued"),
         "title": data.get("title"),
     })
@@ -157,8 +161,11 @@ def download(job_id):
         return error_page("That download link is invalid.", 400)
 
     bitrate = request.args.get("bitrate", "192").strip()
+    effect = request.args.get("effect", "normal").strip().lower()
     if bitrate not in BITRATES:
         return error_page("That MP3 quality option is invalid.", 400)
+    if effect not in {"normal", "8bit"}:
+        return error_page("That audio effect option is invalid.", 400)
 
     try:
         data = provider_status(job_id)
@@ -221,15 +228,19 @@ def download(job_id):
         if stripped.startswith((b"{", b"[", b"<!doctype", b"<html", b"<?xml")):
             return error_page("The provider returned an error document instead of audio. No broken MP3 was saved.")
 
-        # At 8 kbps, use MPEG-2.5-compatible 8 kHz audio for intentionally awful,
-        # tiny output. The normal presets retain 44.1 kHz.
+        # 8 kbps is the deliberately tiny mono setting. The separate 8-bit effect
+        # bit-crushes the signal and narrows bandwidth for a retro/chiptune-like sound.
         output_sample_rate = "8000" if bitrate == "8" else "44100"
-        channel_args = ["-ac", "1"] if bitrate == "8" else []
+        channel_args = ["-ac", "1"] if bitrate == "8" or effect == "8bit" else []
+        filter_args = ["-af", "acrusher=bits=8:mode=lin:mix=1"] if effect == "8bit" else []
+        if effect == "8bit":
+            output_sample_rate = "11025"
         try:
             result = subprocess.run(
                 [
                     "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                     "-i", str(source_path), "-vn", "-map_metadata", "-1",
+                    *filter_args,
                     "-codec:a", "libmp3lame", "-b:a", f"{bitrate}k",
                     "-ar", output_sample_rate, *channel_args, "-id3v2_version", "3",
                     str(output_path),
@@ -254,7 +265,8 @@ def download(job_id):
 
         safe_title = secure_filename(str(data.get("title") or "youtube-audio"))
         safe_title = os.path.splitext(safe_title)[0] or "youtube-audio"
-        filename = f"{safe_title}-{bitrate}kbps.mp3"
+        effect_suffix = "-8bit-retro" if effect == "8bit" else ""
+        filename = f"{safe_title}-{bitrate}kbps{effect_suffix}.mp3"
 
         response = send_file(
             output_path,
