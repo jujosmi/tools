@@ -1,38 +1,27 @@
-# Jujosmi YouTube → MP3 (Render)
+# Jujosmi YouTube → MP3 — Download Fix
 
-This version uses a hosted YouTube media-conversion API instead of having your Render container scrape YouTube directly.
+This build proxies the download through the Flask backend, checks the provider response before returning it as an MP3, and shows an error page instead of saving tiny JSON/XML error bodies as `.mp3`.
 
-## Important
-Only use the tool for content you own or have permission to download/convert.
+## Keep your existing Render secret
+`SOCIALKIT_ACCESS_KEY` must remain set in Render. Do not commit it to GitHub.
 
-## Setup
+## If replacing just files in GitHub
+Replace:
+- `app.py`
+- `static/app.js`
 
-1. Create a SocialKit account and obtain an API access key.
-2. Push this project to GitHub.
-3. Deploy it as a Render Web Service using the included Dockerfile.
-4. In Render, add an environment variable:
-   - `SOCIALKIT_ACCESS_KEY` = your SocialKit access key
-5. Deploy.
+Add:
+- `templates/download_error.html`
 
-## Routes
+You do not need to change the Dockerfile, Procfile, `requirements.txt`, or your existing styles for this fix.
 
-- `/` — homepage
-- `/youtube-mp3` — same converter page
-- `/health` — health check
+Then commit and deploy latest commit in Render.
 
-## How it works
+## What changed
+- Browser downloads from `/api/download/<job_id>` on this app, not directly from the temporary provider URL.
+- The server obtains a fresh URL by checking the async job when the user clicks Download.
+- It validates the provider-issued HTTPS Amazon S3 host.
+- It rejects small/text/JSON/XML responses before setting MP3 download headers.
+- Failed or expired URLs now show a readable error page rather than downloading a 78-byte unusable file.
 
-Browser
-→ Jujosmi Flask app
-→ SocialKit YouTube async download API
-→ temporary MP3 URL
-→ browser download
-
-The provider supports MP3 output and returns a temporary download URL. The async API is intended for longer videos and reports `queued`, `processing`, `ready`, or `failed` states.
-
-## Notes
-
-- The API key is read only from the server environment; it is not exposed in the frontend.
-- No YouTube cookies are required.
-- No Deno or yt-dlp is required in this build.
-- The provider's free plan can be used for initial testing, with limited credits.
+Use only for content you own or are authorized to download/convert.
