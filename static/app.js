@@ -1,6 +1,7 @@
 const form = document.getElementById("form");
 const input = document.getElementById("url");
 const bitrateSelect = document.getElementById("bitrate");
+const effectSelect = document.getElementById("effect");
 const submit = document.getElementById("submit");
 const statusBox = document.getElementById("status");
 const download = document.getElementById("download");
@@ -20,18 +21,20 @@ async function start(){
   hideDownload();
   submit.disabled = true;
   const bitrate = bitrateSelect.value;
-  setStatus(`Preparing ${bitrate} kbps MP3…`);
+  const effect = effectSelect.value;
+  const effectLabel = effect === "8bit" ? "8-bit retro" : "normal";
+  setStatus(`Preparing ${bitrate} kbps ${effectLabel} MP3…`);
 
   try{
     const r = await fetch("/api/convert", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({url:input.value.trim(), bitrate})
+      body:JSON.stringify({url:input.value.trim(), bitrate, effect})
     });
     const data = await r.json();
     if(!r.ok || !data.ok) throw new Error(data.error || "Could not start conversion.");
     setStatus("Retrieving source audio…");
-    await poll(data.jobId, bitrate);
+    await poll(data.jobId, bitrate, effect);
   }catch(err){
     setStatus(err.message || "Something went wrong.", true);
   }finally{
@@ -39,7 +42,7 @@ async function start(){
   }
 }
 
-async function poll(jobId, bitrate){
+async function poll(jobId, bitrate, effect){
   const maxMs = 8 * 60 * 1000;
   const started = Date.now();
 
@@ -50,10 +53,11 @@ async function poll(jobId, bitrate){
 
     if(data.status === "ready"){
       const title = data.title || "your audio";
-      download.textContent = `Download ${bitrate} kbps MP3 — ${title}`;
-      download.href = `${data.downloadPath || `/api/download/${encodeURIComponent(jobId)}`}?bitrate=${encodeURIComponent(bitrate)}`;
+      const effectLabel = effect === "8bit" ? " 8-bit Retro" : "";
+      download.textContent = `Download ${bitrate} kbps${effectLabel} MP3 — ${title}`;
+      download.href = `${data.downloadPath || `/api/download/${encodeURIComponent(jobId)}`}?bitrate=${encodeURIComponent(bitrate)}&effect=${encodeURIComponent(effect)}`;
       download.classList.remove("hidden");
-      setStatus(`Your ${bitrate} kbps MP3 is ready. Starting download automatically…`);
+      setStatus(`Your ${bitrate} kbps${effectLabel} MP3 is ready. Starting download automatically…`);
 
       // Start the download as soon as the job reports ready. Keep the visible link as
       // a fallback in case the browser blocks an automatic download.
