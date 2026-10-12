@@ -1,24 +1,29 @@
 import os
 import re
+import subprocess
+import tempfile
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, render_template, request, jsonify, Response, stream_with_context
+from flask import Flask, render_template, request, jsonify, send_file
 from werkzeug.utils import secure_filename
-from markupsafe import escape
 
 app = Flask(__name__)
 
 SOCIALKIT_ENDPOINT = "https://api.socialkit.dev/v2/youtube/download"
 SOCIALKIT_STATUS = "https://api.socialkit.dev/v2/downloads/{job_id}"
 ACCESS_KEY = os.getenv("SOCIALKIT_ACCESS_KEY", "").strip()
-REQUEST_TIMEOUT = (10, 180)
 
 YT_RE = re.compile(
     r"^(https?://)?(www\.)?(youtube\.com/watch\?v=[\w-]{6,}|youtu\.be/[\w-]{6,}|youtube\.com/shorts/[\w-]{6,})([?&][^\s]*)?$",
     re.I,
 )
 JOB_RE = re.compile(r"^[A-Za-z0-9_-]{8,100}$")
+BITRATES = {"8", "96", "128", "192", "256", "320"}
+MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024
+DOWNLOAD_TIMEOUT = (15, 180)
+FFMPEG_TIMEOUT_SECONDS = 600
 
 def valid_youtube_url(url: str) -> bool:
     return bool(YT_RE.match(url.strip()))
@@ -27,7 +32,6 @@ def error_page(message, code=502):
     return render_template("download_error.html", message=message), code
 
 def provider_status(job_id):
-    """Return provider job data or raise a readable RuntimeError."""
     if not ACCESS_KEY:
         raise RuntimeError("The conversion provider is not configured. Set SOCIALKIT_ACCESS_KEY in Render.")
 
@@ -43,7 +47,6 @@ def provider_status(job_id):
         raise RuntimeError("The conversion provider returned an unreadable status response.")
 
     data = body.get("data") or {}
-    # The provider may return HTTP 200 even when a job status is failed.
     if str(data.get("status", "")).lower() == "failed":
         detail = data.get("error") or data.get("message") or body.get("error")
         code = data.get("errorCode")
@@ -66,7 +69,13 @@ def youtube_mp3():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "provider_configured": bool(ACCESS_KEY)})
+    return jsonify({
+        "ok": True,
+        "provider_configured": bool(ACCESS_KEY),
+        "ffmpeg_available": subprocess.run(
+            ["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).returncode == 0,
+    })
 
 @app.post("/api/convert")
 def convert():
@@ -78,15 +87,19 @@ def convert():
 
     body = request.get_json(silent=True) or {}
     url = str(body.get("url", "")).strip()
+    bitrate = str(body.get("bitrate", "192")).strip()
 
     if not valid_youtube_url(url):
         return jsonify({"ok": False, "error": "Enter a valid YouTube video or Shorts URL."}), 400
+    if bitrate not in BITRATES:
+        return jsonify({"ok": False, "error": "Choose a supported MP3 bitrate."}), 400
 
+    # Request WAV from the provider so Jujosmi can choose the MP3 encoding bitrate itself.
+    # The provider's `quality` parameter describes video resolution, not MP3 bitrate.
     payload = {
         "access_key": ACCESS_KEY,
         "url": url,
-        "format": "mp3",
-        "quality": "480p",
+        "format": "wav",
     }
 
     try:
@@ -109,6 +122,7 @@ def convert():
     return jsonify({
         "ok": True,
         "jobId": job_id,
+        "bitrate": bitrate,
         "status": data.get("status", "queued"),
         "title": data.get("title"),
     })
@@ -133,10 +147,7 @@ def status(job_id):
         "progress": data.get("progress"),
     }
     if state == "ready":
-        # Do not send the third-party URL to the browser; route downloads through our backend
-        # so we can detect error responses and avoid saving tiny JSON/XML files as MP3s.
         result["downloadPath"] = f"/api/download/{job_id}"
-        result["fileSizeMB"] = data.get("fileSizeMB")
         result["durationSeconds"] = data.get("durationSeconds")
     return jsonify(result)
 
@@ -144,6 +155,10 @@ def status(job_id):
 def download(job_id):
     if not JOB_RE.fullmatch(job_id):
         return error_page("That download link is invalid.", 400)
+
+    bitrate = request.args.get("bitrate", "192").strip()
+    if bitrate not in BITRATES:
+        return error_page("That MP3 quality option is invalid.", 400)
 
     try:
         data = provider_status(job_id)
@@ -153,76 +168,110 @@ def download(job_id):
         return error_page(str(exc))
 
     if str(data.get("status", "")).lower() != "ready":
-        return error_page("The MP3 is not ready yet. Return to the converter and check the status again.", 409)
+        return error_page("The source audio is not ready yet. Return to the converter and check the status again.", 409)
 
     download_url = data.get("downloadUrl")
     if not isinstance(download_url, str):
-        return error_page("The provider said the job was ready but did not return a download link.")
+        return error_page("The provider said the audio was ready but did not return a download link.")
 
     parsed = urlparse(download_url)
-    # Only follow provider-issued HTTPS Amazon S3 download URLs. This also prevents user-controlled
-    # URLs from being used to make requests from the server.
     host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or not (
-        host == "amazonaws.com" or host.endswith(".amazonaws.com")
-    ):
+    if parsed.scheme != "https" or not (host == "amazonaws.com" or host.endswith(".amazonaws.com")):
         return error_page("The provider returned an unexpected download address. No file was downloaded.")
 
+    temp = tempfile.TemporaryDirectory(prefix="jujosmi-mp3-")
+    temp_path = Path(temp.name)
+    source_path = temp_path / "source.wav"
+    output_path = temp_path / "converted.mp3"
+
     try:
-        upstream = requests.get(download_url, stream=True, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException:
-        return error_page("The MP3 host could not be reached. Please retry the download.")
+        with requests.get(download_url, stream=True, timeout=DOWNLOAD_TIMEOUT) as upstream:
+            if upstream.status_code >= 400:
+                return error_page("The temporary audio link was rejected or expired. Please run/check the conversion again and retry.")
+            content_type = (upstream.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if content_type.startswith("text/") or "json" in content_type or "xml" in content_type or "html" in content_type:
+                return error_page("The provider returned an error message instead of audio. No broken MP3 was saved.")
 
-    if upstream.status_code >= 400:
-        upstream.close()
-        return error_page("The temporary MP3 link was rejected or expired. Go back, run/check the conversion again, and retry.")
+            try:
+                content_length = int(upstream.headers.get("Content-Length", "0"))
+            except ValueError:
+                content_length = 0
+            if content_length > MAX_SOURCE_BYTES:
+                return error_page("The source audio is too large for this converter's current 2 GB processing limit.")
 
-    content_type = (upstream.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    content_length = upstream.headers.get("Content-Length")
-    try:
-        too_small = content_length is not None and int(content_length) < 256
-    except ValueError:
-        too_small = False
+            total = 0
+            header = bytearray()
+            with source_path.open("wb") as out:
+                for chunk in upstream.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_SOURCE_BYTES:
+                        return error_page("The source audio exceeded this converter's 2 GB processing limit.")
+                    if len(header) < 16:
+                        header.extend(chunk[:16 - len(header)])
+                    out.write(chunk)
 
-    # Read the first chunk before sending download headers. Error pages/JSON from a failed URL
-    # must not be delivered to the visitor with a .mp3 filename.
-    iterator = upstream.iter_content(chunk_size=64 * 1024)
-    first_chunk = next(iterator, b"")
+        # WAV must contain the RIFF/WAVE signature; this rejects tiny JSON/HTML error downloads.
+        if len(header) < 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+            return error_page("The provider did not return a valid WAV audio source. Check the provider job and try again.")
 
-    textual = (
-        content_type.startswith("text/")
-        or "json" in content_type
-        or "xml" in content_type
-        or first_chunk.lstrip().startswith((b"{", b"[", b"<!DOCTYPE", b"<html", b"<?xml"))
-    )
-    if not first_chunk or too_small or textual:
-        upstream.close()
-        return error_page("The provider's link returned an error response instead of MP3 audio. The bad response was blocked instead of being saved as a file.")
-
-    title = str(data.get("title") or "youtube-audio")
-    filename = secure_filename(title) or "youtube-audio"
-    if not filename.lower().endswith(".mp3"):
-        filename += ".mp3"
-
-    def stream_file():
+        # At 8 kbps, use MPEG-2.5-compatible 8 kHz audio for intentionally awful,
+        # tiny output. The normal presets retain 44.1 kHz.
+        output_sample_rate = "8000" if bitrate == "8" else "44100"
+        channel_args = ["-ac", "1"] if bitrate == "8" else []
         try:
-            yield first_chunk
-            for chunk in iterator:
-                if chunk:
-                    yield chunk
-        finally:
-            upstream.close()
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(source_path), "-vn", "-map_metadata", "-1",
+                    "-codec:a", "libmp3lame", "-b:a", f"{bitrate}k",
+                    "-ar", output_sample_rate, *channel_args, "-id3v2_version", "3",
+                    str(output_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=FFMPEG_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError:
+            return error_page("FFmpeg is missing from this deployment. Rebuild using the supplied Dockerfile.")
+        except subprocess.TimeoutExpired:
+            return error_page("Audio encoding took too long. Try a shorter video or a lower bitrate.")
 
-    headers = {
-        "Content-Type": "audio/mpeg",
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-    }
-    if content_length and not too_small:
-        headers["Content-Length"] = content_length
+        if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size < 256:
+            detail = (result.stderr or "").strip().splitlines()
+            human_error = detail[-1][:250] if detail else "The encoder could not create an MP3."
+            return error_page(f"MP3 encoding failed: {human_error}")
 
-    return Response(stream_with_context(stream_file()), headers=headers, direct_passthrough=True)
+        safe_title = secure_filename(str(data.get("title") or "youtube-audio"))
+        safe_title = os.path.splitext(safe_title)[0] or "youtube-audio"
+        filename = f"{safe_title}-{bitrate}kbps.mp3"
+
+        response = send_file(
+            output_path,
+            mimetype="audio/mpeg",
+            as_attachment=True,
+            download_name=filename,
+            conditional=False,
+            max_age=0,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.call_on_close(temp.cleanup)
+        return response
+    except requests.RequestException:
+        temp.cleanup()
+        return error_page("The MP3 source could not be downloaded from the provider. Please try again.")
+    except Exception:
+        temp.cleanup()
+        app.logger.exception("MP3 download/encoding failed")
+        return error_page("Unexpected error while creating your MP3. Please try again.")
+    finally:
+        # The response close callback cleans files after streaming. On early returns/errors,
+        # TemporaryDirectory also cleans up when the function frame exits.
+        pass
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
