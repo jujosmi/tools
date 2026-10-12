@@ -53,7 +53,20 @@ async function poll(jobId, bitrate){
       download.textContent = `Download ${bitrate} kbps MP3 — ${title}`;
       download.href = `${data.downloadPath || `/api/download/${encodeURIComponent(jobId)}`}?bitrate=${encodeURIComponent(bitrate)}`;
       download.classList.remove("hidden");
-      setStatus(`Source audio is ready. Jujosmi will encode the MP3 at ${bitrate} kbps when you download it.`);
+      setStatus(`Your ${bitrate} kbps MP3 is ready. Starting download automatically…`);
+
+      // Start the download as soon as the job reports ready. Keep the visible link as
+      // a fallback in case the browser blocks an automatic download.
+      download.setAttribute("aria-label", `Download ${bitrate} kbps MP3 — ${title}`);
+      download.click();
+
+      // Some browsers may prevent programmatic downloads after an asynchronous wait.
+      // The link remains visible so the user can click it manually if needed.
+      window.setTimeout(() => {
+        if (!download.classList.contains("hidden")) {
+          setStatus("Your MP3 is ready. If the download didn't start, click the Download MP3 link.");
+        }
+      }, 1800);
       return;
     }
 
