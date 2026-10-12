@@ -1,233 +1,143 @@
-import base64
-import binascii
 import os
 import re
-import shutil
-import tempfile
-from pathlib import Path
-from threading import Semaphore
-from urllib.parse import urlparse
-
-from flask import Flask, jsonify, render_template, request, send_file
-import yt_dlp
+import time
+import requests
+from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 
-# Keep a small Render instance from being overwhelmed by concurrent conversions.
-CONVERSION_SLOTS = Semaphore(2)
+SOCIALKIT_ENDPOINT = "https://api.socialkit.dev/v2/youtube/download"
+SOCIALKIT_STATUS = "https://api.socialkit.dev/v2/downloads/{job_id}"
+ACCESS_KEY = os.getenv("SOCIALKIT_ACCESS_KEY", "").strip()
 
-YOUTUBE_HOSTS = {
-    "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
-    "music.youtube.com",
-    "youtu.be",
-    "www.youtu.be",
-}
-
-# Ordered fallback chain. These are public yt-dlp YouTube player clients with
-# different current PO-token requirements. web_embedded only works for videos
-# that allow embedding; web_safari may expose HLS; mweb uses the PO-token
-# provider; tv is a final anonymous fallback.
-YOUTUBE_CLIENTS = tuple(
-    x.strip()
-    for x in os.getenv(
-        "YOUTUBE_CLIENTS",
-        "web_embedded,web_safari,mweb,tv",
-    ).split(",")
-    if x.strip()
+YT_RE = re.compile(
+    r"^(https?://)?(www\.)?(youtube\.com/watch\?v=[\w-]{6,}|youtu\.be/[\w-]{6,}|youtube\.com/shorts/[\w-]{6,})([?&][^\s]*)?$",
+    re.I,
 )
 
+def valid_youtube_url(url: str) -> bool:
+    return bool(YT_RE.match(url.strip()))
 
-def is_youtube_url(value: str) -> bool:
-    try:
-        parsed = urlparse(value.strip())
-        host = (parsed.hostname or "").lower().rstrip(".")
-        return parsed.scheme in {"http", "https"} and host in YOUTUBE_HOSTS
-    except ValueError:
-        return False
-
-
-def safe_filename(name: str) -> str:
-    name = re.sub(r"[\x00-\x1f<>:\"/\\|?*]", "", name)
-    name = re.sub(r"\s+", " ", name).strip(" .")
-    return (name or "youtube-audio")[:180]
-
-
-def find_mp3(folder: Path) -> Path:
-    mp3s = list(folder.glob("*.mp3"))
-    if not mp3s:
-        raise FileNotFoundError("Conversion finished but no MP3 file was produced.")
-    return max(mp3s, key=lambda path: path.stat().st_mtime)
-
-
-def maybe_write_cookie_file(folder: Path) -> Path | None:
-    """Optionally load a cookies.txt file from a Render secret.
-
-    Set YOUTUBE_COOKIES_B64 to a base64-encoded Netscape cookies.txt only when
-    you have a legitimate reason to authenticate requests. Never commit cookies
-    to GitHub or put them directly in source code.
-    """
-    encoded = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
-    if not encoded:
-        return None
-
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise RuntimeError("YOUTUBE_COOKIES_B64 is not valid base64.") from exc
-
-    if len(raw) > 2_000_000:
-        raise RuntimeError("YOUTUBE_COOKIES_B64 is unexpectedly large.")
-
-    cookie_file = folder / "cookies.txt"
-    cookie_file.write_bytes(raw)
-    return cookie_file
-
-
-def build_options(work_dir: Path, client: str, cookie_file: Path | None) -> dict:
-    out_template = str(work_dir / "%(id)s.%(ext)s")
-    options = {
-        "format": "bestaudio/best",
-        "outtmpl": out_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": False,
-        "restrictfilenames": True,
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
-        "extractor_args": {
-            "youtube": {
-                "player_client": [client],
-            },
-        },
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
-    }
-
-    # Only the clients that can use BgUtils should point at its HTTP provider.
-    if client in {"mweb", "web", "web_safari", "ios"}:
-        options["extractor_args"]["youtubepot-bgutilhttp"] = {
-            "base_url": [os.getenv("BGUTIL_BASE_URL", "http://127.0.0.1:4416")],
-        }
-
-    if cookie_file is not None:
-        options["cookiefile"] = str(cookie_file)
-
-    return options
-
-
-def download_mp3(url: str, work_dir: Path) -> tuple[Path, str, str]:
-    cookie_file = maybe_write_cookie_file(work_dir)
-    failures: list[tuple[str, str]] = []
-
-    for client in YOUTUBE_CLIENTS:
-        app.logger.info("Trying YouTube player client: %s", client)
-        try:
-            with yt_dlp.YoutubeDL(build_options(work_dir, client, cookie_file)) as ydl:
-                info = ydl.extract_info(url, download=True)
-                title = safe_filename(info.get("title") or "youtube-audio")
-            return find_mp3(work_dir), title, client
-        except Exception as exc:
-            message = str(exc)
-            failures.append((client, message))
-            app.logger.warning("YouTube client %s failed: %s", client, message)
-
-    summary = " | ".join(
-        f"{client}: {msg[:300]}" for client, msg in failures
-    )
-    raise RuntimeError(f"All YouTube extraction clients failed. {summary}")
-
-
-def friendly_error(exc: Exception) -> str:
-    message = str(exc)
-    lower = message.lower()
-
-    if "sign in to confirm" in lower or "not a bot" in lower:
-        return (
-            "YouTube rejected requests from the converter's server. "
-            "Multiple public extraction clients were tried, but this video "
-            "or the server IP is still being challenged by YouTube."
-        )
-    if "private video" in lower:
-        return "That video is private and cannot be converted."
-    if "video unavailable" in lower or "this video is not available" in lower:
-        return "That video is unavailable."
-    if "age-restricted" in lower:
-        return "That video is age-restricted and cannot be converted anonymously."
-    if "only available for members" in lower or "members-only" in lower:
-        return "That video is members-only and cannot be converted anonymously."
-
-    return "Conversion failed. The video may be unavailable, restricted, or blocked by YouTube."
-
+def api_headers():
+    return {"Content-Type": "application/json", "Accept": "application/json"}
 
 @app.get("/")
 def index():
     return render_template("index.html")
 
-
 @app.get("/youtube-mp3")
-def youtube_mp3_page():
+def youtube_mp3():
     return render_template("index.html")
-
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "service": "jujosmi-youtube-mp3",
-        "yt_dlp": getattr(yt_dlp.version, "__version__", "unknown"),
-        "youtube_clients": list(YOUTUBE_CLIENTS),
-        "po_token_provider": os.getenv("BGUTIL_BASE_URL", "http://127.0.0.1:4416"),
-    })
-
+    return jsonify({"ok": True, "provider_configured": bool(ACCESS_KEY)})
 
 @app.post("/api/convert")
 def convert():
-    payload = request.get_json(silent=True) or {}
-    url = str(payload.get("url", "")).strip()
+    if not ACCESS_KEY:
+        return jsonify({
+            "ok": False,
+            "error": "The conversion provider is not configured yet. Add SOCIALKIT_ACCESS_KEY in Render."
+        }), 503
 
-    if not is_youtube_url(url):
-        return jsonify({"error": "Enter a valid YouTube video URL."}), 400
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
 
-    if not CONVERSION_SLOTS.acquire(blocking=False):
-        return jsonify({"error": "The converter is busy. Please try again in a moment."}), 429
+    if not valid_youtube_url(url):
+        return jsonify({"ok": False, "error": "Enter a valid YouTube video or Shorts URL."}), 400
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="jujosmi-mp3-"))
+    payload = {
+        "access_key": ACCESS_KEY,
+        "url": url,
+        "format": "mp3",
+        "quality": "480p",
+    }
+
     try:
-        try:
-            mp3_path, title, client = download_mp3(url, temp_dir)
-            app.logger.info("YouTube conversion succeeded with client: %s", client)
-        except Exception as exc:
-            app.logger.exception("YouTube conversion failed after all fallbacks")
-            return jsonify({"error": friendly_error(exc)}), 502
+        r = requests.post(SOCIALKIT_ENDPOINT, json=payload, headers=api_headers(), timeout=30)
+        result = r.json()
+    except requests.RequestException:
+        return jsonify({"ok": False, "error": "The media provider could not be reached."}), 502
+    except ValueError:
+        return jsonify({"ok": False, "error": "The media provider returned an invalid response."}), 502
 
-        response = send_file(
-            mp3_path,
-            as_attachment=True,
-            download_name=f"{title}.mp3",
-            mimetype="audio/mpeg",
-            max_age=0,
+    if r.status_code >= 400 or not result.get("success"):
+        message = (
+            result.get("error")
+            or (result.get("data") or {}).get("message")
+            or "The provider could not start the conversion."
         )
+        return jsonify({"ok": False, "error": str(message)}), 502
 
-        @response.call_on_close
-        def cleanup():
-            shutil.rmtree(temp_dir, ignore_errors=True)
+    data_obj = result.get("data") or {}
+    job_id = data_obj.get("jobId")
+    if not job_id:
+        return jsonify({"ok": False, "error": "The provider did not return a conversion job."}), 502
 
-        return response
-    except Exception:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise
-    finally:
-        CONVERSION_SLOTS.release()
+    return jsonify({
+        "ok": True,
+        "jobId": job_id,
+        "status": data_obj.get("status", "queued"),
+        "title": data_obj.get("title"),
+    })
 
+@app.get("/api/status/<job_id>")
+def status(job_id):
+    if not ACCESS_KEY:
+        return jsonify({"ok": False, "error": "Provider is not configured."}), 503
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", job_id):
+        return jsonify({"ok": False, "error": "Invalid job id."}), 400
+
+    try:
+        r = requests.get(
+            SOCIALKIT_STATUS.format(job_id=job_id),
+            headers={"Accept": "application/json", "x-access-key": ACCESS_KEY},
+            timeout=20,
+        )
+        result = r.json()
+    except requests.RequestException:
+        return jsonify({"ok": False, "error": "Could not check conversion status."}), 502
+    except ValueError:
+        return jsonify({"ok": False, "error": "Invalid status response from provider."}), 502
+
+    if r.status_code >= 400 or not result.get("success"):
+        data_obj = result.get("data") or {}
+        message = result.get("error") or data_obj.get("message") or "Conversion status unavailable."
+        return jsonify({"ok": False, "error": str(message)}), 502
+
+    data_obj = result.get("data") or {}
+    status_value = str(data_obj.get("status", "unknown")).lower()
+
+    if status_value == "ready":
+        download_url = data_obj.get("downloadUrl")
+        if not download_url:
+            return jsonify({"ok": False, "error": "Conversion finished without a download link."}), 502
+        return jsonify({
+            "ok": True,
+            "status": "ready",
+            "title": data_obj.get("title") or "youtube-audio",
+            "downloadUrl": download_url,
+            "filename": (data_obj.get("title") or "youtube-audio") + ".mp3",
+            "durationSeconds": data_obj.get("durationSeconds"),
+            "fileSizeMB": data_obj.get("fileSizeMB"),
+        })
+
+    if status_value == "failed":
+        return jsonify({
+            "ok": False,
+            "status": "failed",
+            "error": data_obj.get("error") or data_obj.get("message") or "The provider could not convert this video."
+        }), 502
+
+    return jsonify({
+        "ok": True,
+        "status": status_value,
+        "progress": data_obj.get("progress"),
+        "title": data_obj.get("title"),
+    })
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)

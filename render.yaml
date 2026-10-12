@@ -3,5 +3,6 @@ services:
     name: jujosmi-youtube-mp3
     runtime: docker
     plan: free
-    healthCheckPath: /health
-    autoDeploy: true
+    envVars:
+      - key: SOCIALKIT_ACCESS_KEY
+        sync: false
