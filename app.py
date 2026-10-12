@@ -181,7 +181,8 @@ def download(job_id):
 
     temp = tempfile.TemporaryDirectory(prefix="jujosmi-mp3-")
     temp_path = Path(temp.name)
-    source_path = temp_path / "source.wav"
+    # Let FFmpeg probe the actual container; providers may return a supported audio format different from requested.
+    source_path = temp_path / "source.audio"
     output_path = temp_path / "converted.mp3"
 
     try:
@@ -212,9 +213,13 @@ def download(job_id):
                         header.extend(chunk[:16 - len(header)])
                     out.write(chunk)
 
-        # WAV must contain the RIFF/WAVE signature; this rejects tiny JSON/HTML error downloads.
-        if len(header) < 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
-            return error_page("The provider did not return a valid WAV audio source. Check the provider job and try again.")
+        # Reject obvious error documents but allow FFmpeg to detect the actual audio container.
+        # The API may return a valid supported audio format with a non-WAV header.
+        if len(header) < 4:
+            return error_page("The provider returned an empty or incomplete audio source. Please try again.")
+        stripped = bytes(header).lstrip().lower()
+        if stripped.startswith((b"{", b"[", b"<!doctype", b"<html", b"<?xml")):
+            return error_page("The provider returned an error document instead of audio. No broken MP3 was saved.")
 
         # At 8 kbps, use MPEG-2.5-compatible 8 kHz audio for intentionally awful,
         # tiny output. The normal presets retain 44.1 kHz.
@@ -243,6 +248,8 @@ def download(job_id):
         if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size < 256:
             detail = (result.stderr or "").strip().splitlines()
             human_error = detail[-1][:250] if detail else "The encoder could not create an MP3."
+            if "Invalid data found" in (result.stderr or ""):
+                return error_page("The provider's download link did not contain a readable audio file. Check the provider job and try again.")
             return error_page(f"MP3 encoding failed: {human_error}")
 
         safe_title = secure_filename(str(data.get("title") or "youtube-audio"))
