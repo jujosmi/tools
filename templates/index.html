@@ -24,6 +24,18 @@
                  placeholder="https://www.youtube.com/watch?v=..." required>
           <button id="submit" type="submit">Convert</button>
         </div>
+        <div class="quality-control">
+          <label for="bitrate">MP3 quality</label>
+          <select id="bitrate" name="bitrate">
+            <option value="8">Potato quality — 8 kbps (extremely low)</option>
+            <option value="96">Low — 96 kbps</option>
+            <option value="128">Standard — 128 kbps</option>
+            <option value="192" selected>High — 192 kbps</option>
+            <option value="256">Very High — 256 kbps</option>
+            <option value="320">Extremely High — 320 kbps</option>
+          </select>
+          <p class="quality-help">Higher bitrate means a larger file. It cannot restore detail missing from the original audio.</p>
+        </div>
       </form>
 
       <div id="status" class="status hidden" role="status" aria-live="polite"></div>
